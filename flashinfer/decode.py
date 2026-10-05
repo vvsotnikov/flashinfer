@@ -4004,6 +4004,12 @@ def fast_decode_plan(
     Modifications:
     - Remove unnecessary device-to-device copy for the cuda graph buffers.
     - Remove unnecessary host-to-device copy for the metadata buffers.
+
+    In CUDA graph mode, the caller must update the persistent ``indptr``,
+    ``indices``, and ``last_page_len`` device buffers before replay. Passing
+    new tensors here only updates the host-side plan, not those device buffers.
+    For uniform multi-token decode, first call :meth:`plan` with the same
+    ``q_len_per_req``; that query length is frozen for the graph wrapper.
     """
     batch_size = len(last_page_len)
     if getattr(self, "_backend", None) == "prims-ts":

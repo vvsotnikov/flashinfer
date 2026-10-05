@@ -1201,22 +1201,32 @@ def test_single_decode_torch_compile_cuda_graph():
     )
 
 
-@pytest.mark.parametrize("batch_size", [4, 8])
-@pytest.mark.parametrize("q_len_per_req", [2, 3])
-@pytest.mark.parametrize("num_kv_heads", [2, 8])
-@pytest.mark.parametrize("gqa_group_size", [4, 8])
+@pytest.mark.parametrize(
+    "batch_size,q_len_per_req,num_kv_heads,gqa_group_size,head_dim,page_size,kv_layout",
+    [
+        (b, q, k, g, 128, 16, "NHD")
+        for b in [4, 8]
+        for q in [2, 3]
+        for k in [2, 8]
+        for g in [4, 8]
+    ]
+    + [(b, 4, 2, 6, 256, 32, layout) for b in [1, 8, 64] for layout in ["NHD", "HND"]],
+)
+@pytest.mark.parametrize("fast_replan", [False, True])
 def test_cuda_graph_uniform_multi_token_decode_with_paged_kv_cache(
     batch_size,
     q_len_per_req,
     num_kv_heads,
     gqa_group_size,
+    head_dim,
+    page_size,
+    kv_layout,
+    fast_replan,
 ):
     # Spec-decode verify shape: every request carries q_len_per_req tokens.
     # The tensor-core decode path must produce prefill-wrapper-identical
     # results eagerly, and stay correct when the plan is refreshed with
     # different kv lengths between CUDA graph replays.
-    page_size = 16
-    head_dim = 128
     dtype = torch.bfloat16
     num_qo_heads = num_kv_heads * gqa_group_size
     capture_kv_lens = [129] * batch_size
@@ -1246,13 +1256,17 @@ def test_cuda_graph_uniform_multi_token_decode_with_paged_kv_cache(
     kv_data = torch.randn(
         total_pages, 2, page_size, num_kv_heads, head_dim, dtype=dtype, device="cuda:0"
     )
+    if kv_layout == "HND":
+        kv_data = kv_data.transpose(2, 3).contiguous()
     q = torch.randn(
         batch_size * q_len_per_req, num_qo_heads, head_dim, dtype=dtype, device="cuda:0"
     )
 
     def reference(ref_indptr, ref_indices, ref_last_len):
         ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
-        prefill = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD")
+        prefill = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            ws, kv_layout, backend="fa2"
+        )
         qo_indptr = (
             torch.arange(0, batch_size + 1, dtype=torch.int32, device="cuda:0")
             * q_len_per_req
@@ -1277,7 +1291,8 @@ def test_cuda_graph_uniform_multi_token_decode_with_paged_kv_cache(
     )
     wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
         workspace_buffer,
-        "NHD",
+        kv_layout,
+        backend="fa2",
         use_cuda_graph=True,
         use_tensor_cores=True,
         paged_kv_indptr_buffer=torch.empty(
@@ -1291,8 +1306,19 @@ def test_cuda_graph_uniform_multi_token_decode_with_paged_kv_cache(
         ),
     )
 
-    def plan(plan_indptr, plan_indices, plan_last_len):
-        wrapper.plan(
+    def plan(plan_indptr, plan_indices, plan_last_len, replan=False):
+        if fast_replan and replan:
+            # fast_decode_plan deliberately leaves device metadata updates to
+            # its caller (as in vLLM's persistent metadata buffers).
+            wrapper._paged_kv_indptr_buf.copy_(plan_indptr)
+            wrapper._paged_kv_indices_buf[: len(plan_indices)].copy_(plan_indices)
+            wrapper._paged_kv_last_page_len_buf.copy_(plan_last_len)
+        planner = (
+            partial(flashinfer.decode.fast_decode_plan, wrapper)
+            if fast_replan and replan
+            else wrapper.plan
+        )
+        planner(
             plan_indptr,
             plan_indices,
             plan_last_len,
@@ -1325,7 +1351,8 @@ def test_cuda_graph_uniform_multi_token_decode_with_paged_kv_cache(
 
     for kv_lens in replay_kv_lens_sets:
         new_indptr, new_indices, new_last_len = build_kv_layout(kv_lens)
-        plan(new_indptr, new_indices, new_last_len)
+        q.normal_()
+        plan(new_indptr, new_indices, new_last_len, replan=True)
         torch.cuda.synchronize()
         g.replay()
         torch.cuda.synchronize()
